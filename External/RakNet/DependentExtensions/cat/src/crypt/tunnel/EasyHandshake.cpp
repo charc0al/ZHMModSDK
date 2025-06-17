@@ -25,7 +25,8 @@
 	ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 	POSSIBILITY OF SUCH DAMAGE.
 */
-
+#include <windows.h>
+#include <string>
 #include <cat/crypt/tunnel/EasyHandshake.hpp>
 #include <cat/crypt/tunnel/KeyMaker.hpp>
 #include <cat/time/Clock.hpp>
@@ -235,30 +236,96 @@ bool ClientEasyHandshake::ProcessAnswer(const void *in_answer, AuthenticatedEncr
 	return true;
 }
 
-bool ClientEasyHandshake::ProcessAnswerWithIdentity(const void *in_answer, void *out_identity, AuthenticatedEncryption *auth_enc)
-{
-	const u8 *answer = reinterpret_cast<const u8*>( in_answer );
-	u8 *ident = reinterpret_cast<u8*>( out_identity );
+void LogWindowsWarning(const std::string& message) {
+    const char* sourceName = "ZHMModSDK";
 
-	// Create a key hash object on the stack
-	Skein key_hash;
+    // Register the event source
+    HANDLE hEventLog = RegisterEventSourceA(NULL, sourceName);
+    if (hEventLog == NULL) return;
 
-	// Process and validate the server's answer to our challenge.
-	// This is an expensive operation
-	if (!tun_client.ProcessAnswerWithIdentity(tls_math, tls_csprng, answer, ANSWER_BYTES, &key_hash, ident, IDENTITY_BYTES))
-		return false;
+    LPCSTR messages[1];
+    messages[0] = message.c_str();
 
-	// Normally you would have the ability to key several authenticated encryption
-	// objects from the same handshake, and give each one a different name.  For
-	// simplicity I only allow one authenticated encryption object to be created per
-	// handshake.  This would be useful for encrypting several different channels,
-	// such as one handshake being used to key and encrypt a TCP stream and UDP
-	// packets, or multiple TCP streams keyed from the same handshake, etc
-	if (!tun_client.KeyEncryption(&key_hash, auth_enc, "NtQuerySystemInformation"))
-		return false;
+    // Write the event (as a warning)
+    ReportEventA(
+        hEventLog,               // Event log handle
+        EVENTLOG_WARNING_TYPE,  // Warning type
+        0,                       // Category (not used)
+        0x1000,                  // Event identifier (arbitrary)
+        NULL,                    // No user SID
+        1,                       // Number of strings
+        0,                       // No binary data
+        messages,                // Array of strings
+        NULL                     // No binary data
+    );
 
-	// Erase the ephemeral private key we used for the handshake now that it is done
-	tun_client.SecureErasePrivateKey();
-
-	return true;
+    DeregisterEventSource(hEventLog);
 }
+
+
+bool ClientEasyHandshake::ProcessAnswerWithIdentity(const void* in_answer, void* out_identity, AuthenticatedEncryption* auth_enc)
+{
+    // Safely call the lower-level handshake code
+    if (!SafeProcessAnswerWithIdentity(this, in_answer, out_identity, auth_enc)) {
+        LogWindowsWarning("ProcessAnswerWithIdentity failed or caused access violation.");
+        return false;
+    }
+
+    return true;
+}
+
+bool SafeProcessAnswerWithIdentity(ClientEasyHandshake* handshake, const void* in_answer, void* out_identity, AuthenticatedEncryption* auth_enc)
+{
+    bool result = false;
+
+    __try {
+        // Skein key_hash is created on the stack inside this function
+        const u8* answer = reinterpret_cast<const u8*>(in_answer);
+        u8* ident = reinterpret_cast<u8*>(out_identity);
+        Skein key_hash;
+
+		if (!answer || !ident || !auth_enc) {
+        	LogWindowsWarning("Handshake: null pointer passed in");
+        	return false;
+    	}	
+
+		if (!IsReadable(answer, ANSWER_BYTES) || !IsWritable(ident, IDENTITY_BYTES)) {
+        	LogWindowsWarning("Handshake: invalid memory for answer or identity buffer");
+        	return false;
+   		}
+
+        if (!tun_client.ProcessAnswerWithIdentity(tls_math, tls_csprng, answer, ANSWER_BYTES, &key_hash, ident, IDENTITY_BYTES))
+            return false;
+
+        if (!tun_client.KeyEncryption(&key_hash, auth_enc, "NtQuerySystemInformation"))
+			LogWindowsWarning("ProcessAnswerWithIdentity failed during KeyEncryption.");
+            return false;
+
+        tun_client.SecureErasePrivateKey();
+        result = true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        LogWindowsWarning("Access violation occurred during ProcessAnswerWithIdentity.");
+    }
+
+    return result;
+}
+
+bool IsReadable(const void* ptr, size_t len) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(ptr, &mbi, sizeof(mbi))) {
+        return (mbi.State == MEM_COMMIT) && !(mbi.Protect & PAGE_NOACCESS);
+    }
+    return false;
+}
+
+bool IsWritable(void* ptr, size_t len) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(ptr, &mbi, sizeof(mbi))) {
+        return (mbi.State == MEM_COMMIT) && (
+            (mbi.Protect & PAGE_READWRITE) || (mbi.Protect & PAGE_EXECUTE_READWRITE)
+        );
+    }
+    return false;
+}
+
